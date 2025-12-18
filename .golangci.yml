@@ -1,6 +1,6 @@
-# golangci-lint settings.
-# Ref: https://github.com/golangci/golangci-lint/blob/master/.golangci.example.yml
 
+# golangci-lint settings.
+# Ref: https://github.com/golangci/golangci-lint/blob/master/.golangci.example.yml test
 run:
   timeout: 7m
   skip-dirs:

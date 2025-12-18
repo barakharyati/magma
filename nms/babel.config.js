@@ -11,6 +11,8 @@
  * limitations under the License.
  */
 
+
+
 function isWebpack(caller) {
   return !!(caller && caller.name === 'babel-loader');
 }
