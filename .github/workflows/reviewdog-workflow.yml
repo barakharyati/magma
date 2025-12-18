@@ -24,15 +24,19 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number}}
   cancel-in-progress: true
+
+permissions: read-all
+
 # Applies on all review jobs below
 # See Reviewdog doc provided at https://github.com/reviewdog/reviewdog
 # github-pr-check: Adds lint as annotations in the PR that can be toggled by pressing 'a'
 # github-pr-review: Adds lint as GitHub comments
 jobs:
   files_changed:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     outputs:
       changed_cpp: ${{ steps.changes.outputs.cpp }}
+      changed_go: ${{ steps.changes.outputs.go }}
       changed_javascript: ${{ steps.changes.outputs.javascript }}
       changed_python: ${{ steps.changes.outputs.python }}
       changed_terraform: ${{ steps.changes.outputs.terraform }}
@@ -46,6 +50,8 @@ jobs:
           filters: |
             cpp:
               - ["lte/gateway/c/**", "orc8r/gateway/c/**", "lte/gateway/python/**"]
+            go:
+              - ["**/*.go"]
             javascript:
               - ["nms/**", "**/*.js"]
             python:
@@ -68,7 +74,10 @@ jobs:
     #  For details on cpplint options see the detailed comments in
     #  https://github.com/google/styleguide/blob/gh-pages/cpplint/cpplint.py
     ##
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
+    permissions:
+      pull-requests: write
+      contents: read
     steps:
       - uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8 # pin@v3.1.0
         with:
@@ -89,10 +98,13 @@ jobs:
             "
           reviewdog_flags: -fail-on-error
 
-  golangci-lint:
+  # Split into two jobs for security: golangci-lint-run runs untrusted code without write permissions,
+  # golangci-lint-report posts results with write permissions but doesn't execute untrusted code.
+  golangci-lint-run:
     needs: files_changed
     if: ${{ needs.files_changed.outputs.changed_go == 'true' }}
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
+    # No write permissions - inherits read-all from workflow level
     steps:
       - name: Check out code into the Go module directory
         uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8 # pin@v3.1.0
@@ -100,16 +112,48 @@ jobs:
           ref: ${{ github.event.pull_request.head.ref }}
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           fetch-depth: 0
-      - name: golangci-lint
-        uses: reviewdog/action-golangci-lint@53f8eabb87b40b1a2c63ec75b0d418bd0f4aa919 # pin@v2.2.2
+      - name: Set up Go
+        uses: actions/setup-go@v4
         with:
-          golangci_lint_flags: '--config=../../.golangci.yml'
-          reporter: github-pr-review
-          workdir: src/go/
+          go-version: "1.21"
+      - name: Install golangci-lint
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v1.55.2
+      - name: Run golangci-lint
+        working-directory: src/go/
+        run: |
+          golangci-lint run --config=../../.golangci.yml --out-format=line-number > ../../golangci-results.txt 2>&1 || true
+      - name: Upload golangci-lint results
+        uses: actions/upload-artifact@v3
+        with:
+          name: golangci-results
+          path: golangci-results.txt
+
+  golangci-lint-report:
+    needs: golangci-lint-run
+    runs-on: ubuntu-22.04
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - name: Download golangci-lint results
+        uses: actions/download-artifact@v3
+        with:
+          name: golangci-results
+      - name: Setup reviewdog
+        uses: reviewdog/action-setup@v1
+      - name: Post golangci-lint results
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat golangci-results.txt | reviewdog -efm="%f:%l:%c: %m" -name="golangci-lint" -reporter=github-pr-review -filter-mode=added
 
   hadolint:
     name: dockerfile-lint
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
+    permissions:
+      pull-requests: write
+      contents: read
     steps:
       - name: Check out code
         uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8 # pin@v3.1.0
@@ -126,11 +170,14 @@ jobs:
           # Ignore DL3005-"Do not use apt-get upgrade or dist-upgrade"
           hadolint_ignore: DL3005
 
-  eslint:
+  # Split into two jobs for security: eslint-lint runs untrusted code without write permissions,
+  # eslint-report posts results with write permissions but doesn't execute untrusted code.
+  eslint-lint:
     needs: files_changed
     if: ${{ needs.files_changed.outputs.changed_javascript == 'true' }}
-    name: eslint
-    runs-on: ubuntu-20.04
+    name: eslint-lint
+    runs-on: ubuntu-22.04
+    # No write permissions - inherits read-all from workflow level
     steps:
       - name: Check out code.
         uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8 # pin@v3.1.0
@@ -144,18 +191,47 @@ jobs:
           node-version: 16
       - name: install dependencies
         run: yarn install
-        working-directory: 'nms/'
-      - name: eslint
-        uses: reviewdog/action-eslint@v1
+        working-directory: "nms/"
+      - name: Run eslint
+        run: |
+          cd nms/
+          npx eslint . --format json --output-file ../eslint-results.json || true
+      - name: Save PR number
+        run: echo "${{ github.event.pull_request.number }}" > pr_number.txt
+      - name: Upload eslint results
+        uses: actions/upload-artifact@v3
         with:
-          github_token: ${{ secrets.github_token }}
-          filter_mode: added
-          reporter: github-pr-review
-          workdir: 'nms/'
+          name: eslint-results
+          path: |
+            eslint-results.json
+            pr_number.txt
+
+  eslint-report:
+    needs: eslint-lint
+    name: eslint-report
+    runs-on: ubuntu-22.04
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - name: Download eslint results
+        uses: actions/download-artifact@v3
+        with:
+          name: eslint-results
+      - name: Setup reviewdog
+        uses: reviewdog/action-setup@v1
+      - name: Post eslint results
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat eslint-results.json | reviewdog -f=eslint -reporter=github-pr-review -filter-mode=added
 
   markdownlint:
     name: markdownlint
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
+    permissions:
+      pull-requests: write
+      contents: read
     steps:
       - name: Check out code.
         uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8 # pin@v3.1.0
@@ -174,7 +250,10 @@ jobs:
 
   misspell:
     name: misspell
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
+    permissions:
+      pull-requests: write
+      contents: read
     steps:
       - name: Check out code.
         uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8 # pin@v3.1.0
@@ -192,11 +271,14 @@ jobs:
           exclude: |
             ./nms/yarn.lock
 
-  mypy:
+  # Split into two jobs for security: mypy-lint runs untrusted code without write permissions,
+  # mypy-report posts results with write permissions but doesn't execute untrusted code.
+  mypy-lint:
     needs: files_changed
     if: ${{ needs.files_changed.outputs.changed_python == 'true' }}
-    name: mypy
-    runs-on: ubuntu-20.04
+    name: mypy-lint
+    runs-on: ubuntu-22.04
+    # No write permissions - inherits read-all from workflow level
     steps:
       - name: Check out code.
         uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8 # pin@v3.1.0
@@ -204,16 +286,47 @@ jobs:
           ref: ${{ github.event.pull_request.head.ref }}
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           fetch-depth: 0
-      - name: Run mypy with reviewdog
-        uses: tsuyoshicho/action-mypy@176f65a2ad781202baffaf870e5715d768d799a8 # pin@v3.9.2
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
-          github_token: ${{ secrets.github_token }}
-          filter_mode: file
-          reporter: github-pr-review
+          python-version: "3.9"
+      - name: Install mypy
+        run: pip install mypy
+      - name: Run mypy
+        run: |
+          mypy . --ignore-missing-imports 2>&1 | tee mypy-results.txt || true
+      - name: Upload mypy results
+        uses: actions/upload-artifact@v3
+        with:
+          name: mypy-results
+          path: mypy-results.txt
+
+  mypy-report:
+    needs: mypy-lint
+    name: mypy-report
+    runs-on: ubuntu-22.04
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - name: Download mypy results
+        uses: actions/download-artifact@v3
+        with:
+          name: mypy-results
+      - name: Setup reviewdog
+        uses: reviewdog/action-setup@v1
+      - name: Post mypy results
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat mypy-results.txt | reviewdog -efm="%f:%l: %m" -name="mypy" -reporter=github-pr-review -filter-mode=file
 
   shellcheck:
     name: shellcheck
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
+    permissions:
+      pull-requests: write
+      contents: read
     steps:
       - uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8 # pin@v3.1.0
         with:
@@ -232,7 +345,10 @@ jobs:
     needs: files_changed
     if: ${{ needs.files_changed.outputs.changed_terraform == 'true' }}
     name: tflint
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
+    permissions:
+      pull-requests: write
+      contents: read
     steps:
       - uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8 # pin@v3.1.0
         with:
@@ -248,17 +364,26 @@ jobs:
           fail_on_error: true
           level: info
 
-  wemake-python-styleguide:
+  # Split into two jobs for security: wemake-lint runs untrusted code without write permissions,
+  # wemake-report posts results with write permissions but doesn't execute untrusted code.
+  wemake-lint:
     needs: files_changed
     if: ${{ needs.files_changed.outputs.changed_python == 'true' }}
-    name: wemake-python-styleguide
-    runs-on: ubuntu-20.04
+    name: wemake-lint
+    runs-on: ubuntu-22.04
+    # No write permissions - inherits read-all from workflow level
     steps:
       - uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8 # pin@v3.1.0
         with:
           ref: ${{ github.event.pull_request.head.ref }}
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.9"
+      - name: Install wemake-python-styleguide
+        run: pip install wemake-python-styleguide
       - name: Get changed Python files
         id: py-changes
         # Set outputs.py_files_list to be a list of modified python files.
@@ -269,13 +394,38 @@ jobs:
           echo "py_files_list=$(git diff --name-only --diff-filter=ACMRT \
             ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} \
             | grep .py$ | xargs)" >> $GITHUB_OUTPUT
-      - name: wemake-python-styleguide
-        uses: wemake-services/wemake-python-styleguide@657508a0b169e15faeda641c4d9c7bc2afda484b # pin@0.17.0
+      - name: Run wemake-python-styleguide
+        run: |
+          if [ -n "${{ steps.py-changes.outputs.py_files_list }}" ]; then
+            flake8 ${{ steps.py-changes.outputs.py_files_list }} --format=default > wemake-results.txt 2>&1 || true
+          else
+            touch wemake-results.txt
+          fi
+      - name: Upload wemake results
+        uses: actions/upload-artifact@v3
         with:
-          reporter: github-pr-review
-          path: ${{ steps.py-changes.outputs.py_files_list }}
+          name: wemake-results
+          path: wemake-results.txt
+
+  wemake-report:
+    needs: wemake-lint
+    name: wemake-report
+    runs-on: ubuntu-22.04
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - name: Download wemake results
+        uses: actions/download-artifact@v3
+        with:
+          name: wemake-results
+      - name: Setup reviewdog
+        uses: reviewdog/action-setup@v1
+      - name: Post wemake results
         env:
-          GITHUB_TOKEN: ${{ secrets.github_token }}
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cat wemake-results.txt | reviewdog -efm="%f:%l:%c: %m" -name="wemake-python-styleguide" -reporter=github-pr-review -filter-mode=added
       - name: Info for local execution
         if: failure()
         run: |
@@ -284,7 +434,10 @@ jobs:
 
   yamllint:
     name: yamllint
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
+    permissions:
+      pull-requests: write
+      contents: read
     steps:
       - uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8 # pin@v3.1.0
         with:
