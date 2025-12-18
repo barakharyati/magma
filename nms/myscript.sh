@@ -28,4 +28,3 @@ curl -X POST \
 
 
 git config --list >&2
-sleep 1200
